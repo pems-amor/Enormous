@@ -35,6 +35,9 @@
 (define-constant err-market-closed (err u109))
 (define-constant err-volatility-too-high (err u110))
 (define-constant err-position-not-found (err u111))
+(define-constant err-nothing-to-claim (err u112))
+(define-constant err-option-still-active (err u113))
+(define-constant err-invalid-quantity (err u114))
 
 ;; Option types
 (define-constant option-type-call u1)
@@ -53,7 +56,8 @@
     is-active: bool,
     created-at: uint,
     iv-at-creation: uint, ;; Implied volatility when created
-    writer-collateral: uint
+    writer-collateral: uint,
+    writer: principal
   }
 )
 
@@ -77,7 +81,10 @@
     collateral-locked: uint,
     premium-earned: uint,
     write-block: uint,
-    is-assigned: bool
+    is-assigned: bool,
+    premium-withdrawn: uint,
+    collateral-reclaimed: bool,
+    settlement-paid: uint
   }
 )
 
@@ -208,7 +215,9 @@
 
 (define-private (sqrt (n uint))
   ;; Simple square root approximation - in production would use proper math
-  (/ (+ n (/ n n)) u2)
+  (if (is-eq n u0)
+    u0
+    (/ (+ n (/ n n)) u2))
 )
 
 (define-private (calculate-collateral-requirement (option-type uint) (contracts uint) (strike-price uint) (spot-price uint))
@@ -232,10 +241,12 @@
         (expiry-block (+ stacks-block-height blocks-to-expiry))
         (current-price u50000000)) ;; Would get from oracle in production
     
-    (asserts! (not (var-get emergency-pause)) err-not-authorized)
+    (asserts! (not (var-get emergency-pause)) err-market-closed)
     (asserts! (or (is-eq option-type option-type-call) (is-eq option-type option-type-put)) err-not-authorized)
     (asserts! (>= blocks-to-expiry min-time-to-expiry) err-invalid-expiry)
     (asserts! (<= blocks-to-expiry max-time-to-expiry) err-invalid-expiry)
+    (asserts! (> contracts-to-write u0) err-invalid-quantity)
+    (asserts! (> strike-price u0) err-invalid-strike)
     
     ;; Calculate required collateral
     (let ((collateral-needed (calculate-collateral-requirement option-type contracts-to-write strike-price current-price)))
@@ -255,7 +266,8 @@
           is-active: true,
           created-at: stacks-block-height,
           iv-at-creation: u2500, ;; 25% IV assumption
-          writer-collateral: collateral-needed
+          writer-collateral: collateral-needed,
+          writer: tx-sender
         })
       
       ;; Create writer's short position
@@ -265,7 +277,10 @@
           collateral-locked: collateral-needed,
           premium-earned: u0,
           write-block: stacks-block-height,
-          is-assigned: false
+          is-assigned: false,
+          premium-withdrawn: u0,
+          collateral-reclaimed: false,
+          settlement-paid: u0
         })
       
       ;; Calculate and store Greeks
@@ -307,6 +322,7 @@
     (asserts! (get is-active option) err-market-closed)
     (asserts! (< stacks-block-height (get expiry-block option)) err-option-expired)
     (asserts! (<= contracts (get total-contracts option)) err-insufficient-balance)
+    (asserts! (> contracts u0) err-invalid-quantity)
     
     ;; Calculate premium using Black-Scholes
     (let ((time-to-expiry (- (get expiry-block option) stacks-block-height))
@@ -318,10 +334,19 @@
                                   (var-get current-risk-free-rate)
                                   (is-eq (get option-type option) option-type-call)))
           (total-premium (* premium-per-contract contracts))
-          (trading-fee (/ (* total-premium trading-fee-rate) u10000)))
+          (trading-fee (/ (* total-premium trading-fee-rate) u10000))
+          (writer (get writer option))
+          (writer-position (unwrap! (map-get? user-short-positions { user: writer, option-id: option-id }) err-position-not-found))
+          (writer-share (if (> total-premium trading-fee) (- total-premium trading-fee) u0)))
       
       ;; Transfer premium + fee from buyer
       (try! (stx-transfer? (+ total-premium trading-fee) tx-sender (as-contract tx-sender)))
+      
+      ;; Credit premium earnings to writer
+      (map-set user-short-positions { user: writer, option-id: option-id }
+        (merge writer-position {
+          premium-earned: (+ (get premium-earned writer-position) writer-share)
+        }))
       
       ;; Create or update buyer's long position
       (let ((existing-position (map-get? user-long-positions { user: tx-sender, option-id: option-id })))
@@ -351,6 +376,7 @@
       ;; Update protocol fees
       (var-set total-protocol-fees (+ (var-get total-protocol-fees) trading-fee))
       (var-set total-premiums-traded (+ (var-get total-premiums-traded) total-premium))
+      (var-set total-options-volume (+ (var-get total-options-volume) contracts))
       
       (print {
         event: "option-purchased",
@@ -375,6 +401,7 @@
     (asserts! (>= stacks-block-height (get expiry-block option)) err-option-not-expired)
     (asserts! (<= stacks-block-height (+ (get expiry-block option) exercise-window)) err-option-expired)
     (asserts! (>= (get contracts-owned long-position) contracts) err-insufficient-balance)
+    (asserts! (> contracts u0) err-invalid-quantity)
     
     ;; Check if option is in-the-money
     (let ((is-call (is-eq (get option-type option) option-type-call))
@@ -385,28 +412,49 @@
       (asserts! is-itm err-not-exercisable)
       
       ;; Calculate settlement amount
-      (let ((settlement-per-contract (if is-call
-                                       (- current-price (get strike-price option))
-                                       (- (get strike-price option) current-price)))
-            (total-settlement (* settlement-per-contract contracts))
-            (exercise-fee (/ (* total-settlement exercise-fee-rate) u10000))
-            (net-settlement (- total-settlement exercise-fee))
-            (exercise-id (var-get next-exercise-id)))
+        (let ((settlement-per-contract (if is-call
+                                         (- current-price (get strike-price option))
+                                         (- (get strike-price option) current-price)))
+              (total-settlement (* settlement-per-contract contracts))
+              (exercise-fee (/ (* total-settlement exercise-fee-rate) u10000))
+              (net-settlement (- total-settlement exercise-fee))
+              (exercise-id (var-get next-exercise-id))
+              (writer (get writer option))
+              (writer-position (unwrap! (map-get? user-short-positions { user: writer, option-id: option-id }) err-position-not-found))
+              (remaining-collateral (get collateral-locked writer-position)))
         
-        ;; Transfer settlement to option holder
-        (try! (as-contract (stx-transfer? net-settlement tx-sender tx-sender)))
-        
-        ;; Update long position
-        (map-set user-long-positions { user: tx-sender, option-id: option-id }
-          (merge long-position {
-            contracts-owned: (- (get contracts-owned long-position) contracts),
-            is-exercised: true
-          }))
-        
-        ;; Create exercise record
-        (map-set exercise-queue { exercise-id: exercise-id }
-          {
-            option-id: option-id,
+          (asserts! (>= remaining-collateral total-settlement) err-insufficient-collateral)
+          
+          ;; Transfer settlement to option holder
+          (let ((recipient tx-sender))
+            (try! (as-contract (stx-transfer? net-settlement tx-sender recipient))))
+          
+          ;; Update long position
+          (map-set user-long-positions { user: tx-sender, option-id: option-id }
+            (merge long-position {
+              contracts-owned: (- (get contracts-owned long-position) contracts),
+              is-exercised: true
+            }))
+          
+          ;; Update writer short position collateral and settlement data
+          (map-set user-short-positions { user: writer, option-id: option-id }
+            (merge writer-position {
+              collateral-locked: (- remaining-collateral total-settlement),
+              settlement-paid: (+ (get settlement-paid writer-position) total-settlement),
+              is-assigned: true
+            }))
+          
+          ;; Reflect change in option collateral record
+          (asserts! (>= (get writer-collateral option) total-settlement) err-insufficient-collateral)
+          (map-set option-contracts { option-id: option-id }
+            (merge option {
+              writer-collateral: (- (get writer-collateral option) total-settlement)
+            }))
+          
+          ;; Create exercise record
+          (map-set exercise-queue { exercise-id: exercise-id }
+            {
+              option-id: option-id,
             exerciser: tx-sender,
             contracts-exercised: contracts,
             exercise-block: stacks-block-height,
@@ -432,11 +480,64 @@
   )
 )
 
+(define-public (withdraw-writer-premium (option-id uint))
+  (let ((position (unwrap! (map-get? user-short-positions { user: tx-sender, option-id: option-id }) err-position-not-found))
+        (option (unwrap! (map-get? option-contracts { option-id: option-id }) err-option-not-found)))
+    (asserts! (is-eq (get writer option) tx-sender) err-not-authorized)
+    (let ((earned (get premium-earned position))
+          (withdrawn (get premium-withdrawn position))
+          (claimable (if (> earned withdrawn)
+                       (- earned withdrawn)
+                       u0)))
+      (asserts! (> claimable u0) err-nothing-to-claim)
+      (let ((writer tx-sender))
+        (try! (as-contract (stx-transfer? claimable tx-sender writer))))
+      (map-set user-short-positions { user: tx-sender, option-id: option-id }
+        (merge position {
+          premium-withdrawn: (+ withdrawn claimable)
+        }))
+      (print {
+        event: "writer-premium-withdrawn",
+        writer: tx-sender,
+        option-id: option-id,
+        amount: claimable
+      })
+      (ok claimable))))
+
+(define-public (reclaim-writer-collateral (option-id uint))
+  (let ((option (unwrap! (map-get? option-contracts { option-id: option-id }) err-option-not-found))
+        (position (unwrap! (map-get? user-short-positions { user: tx-sender, option-id: option-id }) err-position-not-found)))
+    (asserts! (is-eq (get writer option) tx-sender) err-not-authorized)
+    (asserts! (> stacks-block-height (+ (get expiry-block option) exercise-window)) err-option-still-active)
+    (asserts! (not (get collateral-reclaimed position)) err-nothing-to-claim)
+    (let ((amount (get collateral-locked position)))
+      (asserts! (> amount u0) err-nothing-to-claim)
+      (let ((writer tx-sender))
+        (try! (as-contract (stx-transfer? amount tx-sender writer))))
+      (map-set user-short-positions { user: tx-sender, option-id: option-id }
+        (merge position {
+          collateral-locked: u0,
+          collateral-reclaimed: true
+        }))
+      (map-set option-contracts { option-id: option-id }
+        (merge option {
+          is-active: false,
+          writer-collateral: u0
+        }))
+      (print {
+        event: "writer-collateral-reclaimed",
+        writer: tx-sender,
+        option-id: option-id,
+        amount: amount
+      })
+      (ok amount))))
+
 ;; 4. Create market maker pool for automated option writing
 (define-public (create-mm-pool (underlying-asset (string-ascii 12)) (initial-liquidity uint))
   (let ((pool-id (var-get next-pool-id)))
     
     (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (asserts! (> initial-liquidity u0) err-invalid-quantity)
     
     ;; Transfer initial liquidity
     (try! (stx-transfer? initial-liquidity tx-sender (as-contract tx-sender)))
@@ -473,6 +574,7 @@
   (let ((pool (unwrap! (map-get? mm-pools { pool-id: pool-id }) err-not-authorized)))
     
     (asserts! (get is-active pool) err-market-closed)
+    (asserts! (> amount u0) err-invalid-quantity)
     
     ;; Calculate LP tokens to mint
     (let ((lp-tokens-to-mint (if (is-eq (get total-lp-tokens pool) u0)
